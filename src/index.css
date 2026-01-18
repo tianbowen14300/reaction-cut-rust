@@ -1,3 +1,218 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --primary-color: rgb(0, 161, 214);
+  --primary-text: rgb(233, 233, 233);
+  --scroller-color: color-mix(in srgb, var(--primary-color) 60%, var(--block-color));
+  --content-color: #1a1a1a;
+  --desc-color: #9e9e9e;
+  --split-color: #e0e0e0;
+  --block-color: #fafafa;
+  --solid-block-color: #fafafa;
+  --button-color: #00000009;
+  --solid-button-color: #00000006;
+  --ink: var(--content-color);
+  --muted: var(--desc-color);
+  --surface: var(--block-color);
+  --surface-strong: var(--solid-block-color);
+  --accent: var(--primary-color);
+  --accent-2: #0f766e;
+}
+
+html.light {
+  --content-color: #1a1a1a;
+  --desc-color: #9e9e9e;
+  --split-color: #e0e0e0;
+  --block-color: #fafafa;
+  --solid-block-color: #fafafa;
+  --button-color: #00000009;
+  --solid-button-color: #00000006;
+}
+
+html.dark {
+  --content-color: rgb(233, 233, 233);
+  --desc-color: #a2a7ae;
+  --split-color: #c4c4c433;
+  --block-color: #ffffff0d;
+  --solid-block-color: #24292e;
+  --button-color: #a2a7ae18;
+  --solid-button-color: #a2a7ae10;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background-color: #f2f4f7;
+  color: var(--content-color);
+}
+
+* {
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    Cantarell,
+    "Open Sans",
+    "Helvetica Neue",
+    sans-serif;
+  text-rendering: optimizeLegibility;
+  box-sizing: border-box;
+}
+
+button,
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="email"],
+select,
+textarea {
+  appearance: none;
+  outline: none;
+  line-height: 1;
+  border-radius: 8px;
+  font-size: 14px;
+  padding: 6px 10px;
+  background-color: var(--button-color);
+  color: var(--content-color);
+  border: 1px solid transparent;
+}
+
+textarea {
+  line-height: 1.4;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+a {
+  cursor: pointer;
+  color: var(--primary-color);
+}
+
+hr {
+  border: none;
+  height: 1px;
+  margin: 16px 0;
+  background-color: var(--split-color);
+  flex-shrink: 0;
+}
+
+img {
+  -webkit-user-drag: none;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 6px;
+  background-color: var(--scroller-color);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--primary-color);
+}
+
+::selection {
+  background-color: var(--scroller-color);
+}
+
+@layer components {
+  .app-shell {
+    @apply flex w-full h-full text-[var(--content-color)];
+  }
+  .sidebar {
+    @apply flex flex-col items-stretch py-4 px-3 gap-3 h-full w-40;
+    @apply bg-[var(--block-color)];
+  }
+  .sidebar button {
+    @apply relative flex items-center justify-start w-full h-10 rounded-lg px-3;
+    @apply text-[var(--desc-color)] transition-colors text-sm;
+    @apply bg-transparent border-none;
+  }
+  .sidebar button:hover,
+  .sidebar button.active {
+    @apply text-[var(--primary-color)];
+  }
+  .sidebar .menu-label {
+    @apply leading-none font-medium;
+  }
+  .main-shell {
+    @apply flex flex-col relative w-full h-full overflow-hidden;
+  }
+  .title-bar {
+    @apply flex items-center justify-between h-10 pl-4 pr-6;
+    @apply text-sm text-[var(--desc-color)];
+    @apply bg-transparent;
+  }
+  .avatar-btn {
+    @apply flex items-center justify-center w-10 h-10 rounded-full;
+    @apply border border-[var(--split-color)];
+    @apply bg-[var(--solid-button-color)] overflow-hidden;
+  }
+  .avatar-btn.active {
+    @apply border-[var(--primary-color)];
+  }
+  .avatar-btn img {
+    @apply w-full h-full object-cover;
+  }
+  .avatar-fallback {
+    @apply w-full h-full rounded-full;
+    background-color: #cfcfcf;
+  }
+  .content-wrap {
+    @apply flex-1 min-h-0 overflow-hidden;
+  }
+  .page {
+    @apply flex flex-col relative w-full h-full overflow-hidden px-6 py-4 gap-4;
+  }
+  .page-scroll {
+    @apply flex-1 min-h-0 overflow-y-auto pr-1;
+  }
+  .panel {
+    @apply rounded-lg border border-[var(--split-color)];
+    @apply bg-[var(--block-color)];
+  }
+  .tab {
+    @apply flex flex-col items-start gap-1;
+  }
+  .tab button {
+    @apply pr-0 w-44 flex items-center justify-end gap-2 bg-transparent;
+    @apply border-none hover:bg-[var(--solid-button-color)];
+    @apply text-[var(--desc-color)];
+  }
+  .tab button.active {
+    @apply bg-[var(--button-color)] text-[var(--primary-color)];
+  }
+  .tab button label {
+    @apply w-1 h-4 rounded-md invisible shrink-0;
+    background-color: var(--primary-color);
+  }
+  .tab button.active label {
+    @apply visible;
+  }
+  .desc {
+    @apply text-sm text-[var(--desc-color)];
+  }
+}

@@ -1,14 +1,201 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+use std::sync::{Arc, Mutex};
+
+use tokio::time::{sleep, Duration};
+
+use tauri::Manager;
+
+mod api;
+mod app_log;
+mod bilibili;
+mod commands;
+mod config;
+mod db;
+mod ffmpeg;
+mod live_recorder;
+mod login_store;
+mod processing;
+mod utils;
+
+struct AppState {
+    db: Arc<db::Db>,
+    bilibili: Arc<bilibili::client::BilibiliClient>,
+    login_store: Arc<login_store::LoginStore>,
+    log_path: Arc<std::path::PathBuf>,
+    app_log_path: Arc<std::path::PathBuf>,
+    download_runtime: Arc<DownloadRuntime>,
+    live_runtime: Arc<live_recorder::LiveRuntime>,
+    edit_upload_state: Arc<Mutex<commands::submission::EditUploadState>>,
+}
+
+struct DownloadRuntime {
+    active_count: Mutex<i64>,
+}
+
+impl DownloadRuntime {
+    fn new() -> Self {
+        Self {
+            active_count: Mutex::new(0),
+        }
+    }
+}
+
+fn init_panic_log(path: Arc<std::path::PathBuf>) {
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        app_log::append_log(
+            &path,
+            &format!("panic ts={} location={} info={}", app_log::now_millis(), location, info),
+        );
+    }));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
-        .run(tauri::generate_context!())
+        .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            let state = window.app_handle().state::<AppState>();
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    utils::append_log(&state.app_log_path, "window_close_requested");
+                }
+                tauri::WindowEvent::Destroyed => {
+                    utils::append_log(&state.app_log_path, "window_destroyed");
+                }
+                _ => {}
+            }
+        })
+        .setup(|app| {
+            let app_dir = app.path().app_data_dir()?;
+            let db_path = app_dir.join("reaction-cut-rust.sqlite3");
+            let db = Arc::new(db::Db::new(db_path)?);
+            let login_path = app_dir.join("bilibili_login_info.json");
+            let log_path = app_dir.join("auth_debug.log");
+            let app_log_path = app_dir.join("app_debug.log");
+            let panic_log_path = app_dir.join("panic_debug.log");
+            utils::append_log(&app_log_path, "app_start");
+            init_panic_log(Arc::new(panic_log_path));
+            let heartbeat_path = app_log_path.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    utils::append_log(&heartbeat_path, "heartbeat");
+                    sleep(Duration::from_secs(30)).await;
+                }
+            });
+            let state = AppState {
+                db,
+                bilibili: Arc::new(bilibili::client::BilibiliClient::new()),
+                login_store: Arc::new(login_store::LoginStore::new(login_path)),
+                log_path: Arc::new(log_path),
+                app_log_path: Arc::new(app_log_path),
+                download_runtime: Arc::new(DownloadRuntime::new()),
+                live_runtime: Arc::new(live_recorder::new_live_runtime()),
+                edit_upload_state: Arc::new(Mutex::new(
+                    commands::submission::EditUploadState::default(),
+                )),
+            };
+            let live_context = live_recorder::LiveContext {
+                db: Arc::clone(&state.db),
+                bilibili: Arc::clone(&state.bilibili),
+                login_store: Arc::clone(&state.login_store),
+                app_log_path: Arc::clone(&state.app_log_path),
+                live_runtime: Arc::clone(&state.live_runtime),
+            };
+            live_recorder::start_auto_record_loop(live_context);
+            commands::submission::start_submission_background_tasks(
+                Arc::clone(&state.db),
+                Arc::clone(&state.bilibili),
+                Arc::clone(&state.login_store),
+                Arc::clone(&state.app_log_path),
+                Arc::clone(&state.edit_upload_state),
+            );
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::file_scanner::scan_path,
+            commands::file_scanner::validate_directory,
+            commands::file_scanner::video_duration,
+            commands::auth::auth_qrcode_generate,
+            commands::auth::auth_qrcode_poll,
+            commands::auth::auth_sms_login,
+            commands::auth::auth_pwd_login,
+            commands::auth::auth_status,
+            commands::auth::auth_client_log,
+            commands::auth::auth_logout,
+            commands::auth::auth_perform_qrcode_login,
+            commands::settings::get_download_settings,
+            commands::settings::update_download_settings,
+            commands::settings::get_live_settings,
+            commands::settings::update_live_settings,
+            commands::anchor::anchor_subscribe,
+            commands::anchor::anchor_list,
+            commands::anchor::anchor_unsubscribe,
+            commands::anchor::anchor_check,
+            commands::live::live_record_start,
+            commands::live::live_record_stop,
+            commands::live::live_room_auto_record_update,
+            commands::video::video_detail,
+            commands::video::video_playurl,
+            commands::video::video_playurl_by_aid,
+            commands::video::video_proxy_image,
+            commands::video::bilibili_collections,
+            commands::video::bilibili_partitions,
+            commands::download::download_video,
+            commands::download::download_get,
+            commands::download::download_list_by_status,
+            commands::download::download_delete,
+            commands::download::download_retry,
+            commands::process::process_create,
+            commands::process::process_status,
+            commands::toolbox::toolbox_remux,
+            commands::submission::submission_create,
+            commands::submission::submission_update,
+            commands::submission::submission_repost,
+            commands::submission::submission_resegment,
+            commands::submission::submission_list,
+            commands::submission::submission_list_by_status,
+            commands::submission::submission_detail,
+            commands::submission::submission_edit_prepare,
+            commands::submission::submission_edit_add_segment,
+            commands::submission::submission_edit_reupload_segment,
+            commands::submission::submission_edit_upload_status,
+            commands::submission::submission_edit_upload_clear,
+            commands::submission::submission_edit_submit,
+            commands::submission::submission_delete,
+            commands::submission::submission_execute,
+            commands::submission::submission_integrated_execute,
+            commands::submission::submission_upload_execute,
+            commands::submission::submission_retry_segment_upload,
+            commands::submission::workflow_status,
+            commands::submission::workflow_pause,
+            commands::submission::workflow_resume,
+            commands::submission::workflow_cancel,
+        ])
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    app.run(|app_handle, event| {
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            match event {
+                tauri::RunEvent::Ready => {
+                    utils::append_log(&state.app_log_path, "run_ready");
+                }
+                tauri::RunEvent::ExitRequested { code, .. } => {
+                    utils::append_log(
+                        &state.app_log_path,
+                        &format!("run_exit_requested code={:?}", code),
+                    );
+                }
+                tauri::RunEvent::Exit => {
+                    utils::append_log(&state.app_log_path, "run_exit");
+                }
+                _ => {}
+            }
+        }
+    });
 }

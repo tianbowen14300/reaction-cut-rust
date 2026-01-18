@@ -5,7 +5,7 @@
   "identifier": "com.tbw.reaction-cut-rust",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:5176",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
