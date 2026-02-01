@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 
 use tokio::time::{sleep, Duration};
 
-use tauri::path::BaseDirectory;
 use tauri::Manager;
 
 mod api;
@@ -87,19 +86,13 @@ pub fn run() {
             let app_log_path = app_dir.join("app_debug.log");
             let panic_log_path = app_dir.join("panic_debug.log");
             utils::append_log(&app_log_path, "app_start");
-            match app.path().resolve("bin", BaseDirectory::Resource) {
-                Ok(resource_dir) => {
-                    utils::append_log(
-                        &app_log_path,
-                        &format!("resource_bin_dir={}", resource_dir.to_string_lossy()),
-                    );
-                }
-                Err(err) => {
-                    utils::append_log(
-                        &app_log_path,
-                        &format!("resource_bin_dir_error={}", err),
-                    );
-                }
+            if let Some(resource_dir) = config::resolve_resource_bin_dir(&app.handle()) {
+                utils::append_log(
+                    &app_log_path,
+                    &format!("resource_bin_dir={}", resource_dir.to_string_lossy()),
+                );
+            } else {
+                utils::append_log(&app_log_path, "resource_bin_dir_missing");
             }
             let ffmpeg_path = config::resolve_ffmpeg_path();
             let ffprobe_path = config::resolve_ffprobe_path();
@@ -148,6 +141,8 @@ pub fn run() {
                 app_log_path: Arc::clone(&state.app_log_path),
                 live_runtime: Arc::clone(&state.live_runtime),
             };
+            live_recorder::recover_stale_recordings(live_context.clone());
+            live_recorder::start_record_recovery_loop(live_context.clone());
             live_recorder::start_auto_record_loop(live_context);
             login_refresh::start_cookie_refresh_loop(
                 Arc::clone(&state.db),

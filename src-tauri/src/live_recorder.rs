@@ -7,7 +7,7 @@ use std::sync::{
   atomic::{AtomicBool, Ordering},
   mpsc, Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use reqwest::blocking::Client;
@@ -112,6 +112,327 @@ impl LiveRuntime {
       }
     }
   }
+}
+
+const STALE_RECORD_REMUX_MAX_AGE_SECS: u64 = 36 * 60 * 60;
+const STALE_RECORD_IDLE_SECS: u64 = 30 * 60;
+const STALE_RECORD_RECOVERY_INTERVAL_SECS: u64 = 10 * 60;
+
+pub fn recover_stale_recordings(context: LiveContext) {
+  let records = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT id, file_path FROM live_record_task WHERE status = 'RECORDING'",
+      )?;
+      let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+      })?;
+      Ok(rows.collect::<Result<Vec<(i64, String)>, _>>()?)
+    })
+    .unwrap_or_default();
+
+  if records.is_empty() {
+    append_log(&context.app_log_path, "record_recover_stale none");
+    return;
+  }
+
+  append_log(
+    &context.app_log_path,
+    &format!("record_recover_stale start count={}", records.len()),
+  );
+
+  let mut remux_targets = Vec::new();
+  for (record_id, file_path) in records {
+    let path = PathBuf::from(&file_path);
+    let file_meta = match std::fs::metadata(&path) {
+      Ok(meta) => meta,
+      Err(_) => {
+        let _ = update_record_task(
+          &context.db,
+          record_id,
+          "FAILED",
+          Some(now_rfc3339()),
+          0,
+          Some("录制恢复失败: 文件缺失"),
+        );
+        append_log(
+          &context.app_log_path,
+          &format!("record_recover_missing record_id={} path={}", record_id, file_path),
+        );
+        continue;
+      }
+    };
+
+    let file_size = file_meta.len();
+    let end_time = now_rfc3339();
+    let (status, error_message) = if file_size == 0 {
+      ("FAILED", Some("录制恢复失败: 空文件"))
+    } else {
+      ("STOPPED", None)
+    };
+
+    if let Err(err) = update_record_task(
+      &context.db,
+      record_id,
+      status,
+      Some(end_time.clone()),
+      file_size,
+      error_message,
+    ) {
+      append_log(
+        &context.app_log_path,
+        &format!("record_recover_update_fail record_id={} err={}", record_id, err),
+      );
+      continue;
+    }
+
+    let metadata_path = path.with_extension("metadata.json");
+    if metadata_path.exists() {
+      if let Err(err) =
+        update_metadata_file(metadata_path.to_string_lossy().as_ref(), &end_time, file_size)
+      {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "record_metadata_update_failed record_id={} err={}",
+            record_id, err
+          ),
+        );
+      }
+    }
+
+    let mp4_path = path.with_extension("mp4");
+    if mp4_path.exists() {
+      let mp4_size = std::fs::metadata(&mp4_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+      let mp4_path_str = mp4_path.to_string_lossy().to_string();
+      if let Err(err) = update_record_task_file_path(
+        &context.db,
+        record_id,
+        &mp4_path_str,
+        mp4_size,
+      ) {
+        append_log(
+          &context.app_log_path,
+          &format!("record_recover_mp4_update_fail record_id={} err={}", record_id, err),
+        );
+      }
+      continue;
+    }
+
+    if status == "FAILED" {
+      continue;
+    }
+
+    let should_remux = file_meta
+      .modified()
+      .ok()
+      .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+      .map(|age| age <= Duration::from_secs(STALE_RECORD_REMUX_MAX_AGE_SECS))
+      .unwrap_or(false);
+    if should_remux {
+      remux_targets.push((record_id, file_path));
+    }
+  }
+
+  if remux_targets.is_empty() {
+    append_log(&context.app_log_path, "record_recover_stale remux=none");
+    return;
+  }
+
+  append_log(
+    &context.app_log_path,
+    &format!("record_recover_stale remux={}", remux_targets.len()),
+  );
+  for (record_id, file_path) in remux_targets {
+    spawn_segment_remux(context.clone(), record_id, file_path);
+  }
+}
+
+async fn recover_idle_recordings(context: LiveContext) {
+  let records = context
+    .db
+    .with_conn(|conn| {
+      let mut stmt = conn.prepare(
+        "SELECT id, room_id, file_path FROM live_record_task WHERE status = 'RECORDING'",
+      )?;
+      let rows = stmt.query_map([], |row| {
+        Ok((
+          row.get::<_, i64>(0)?,
+          row.get::<_, String>(1)?,
+          row.get::<_, String>(2)?,
+        ))
+      })?;
+      Ok(rows.collect::<Result<Vec<(i64, String, String)>, _>>()?)
+    })
+    .unwrap_or_default();
+
+  if records.is_empty() {
+    append_log(&context.app_log_path, "record_recover_idle none");
+    return;
+  }
+
+  append_log(
+    &context.app_log_path,
+    &format!("record_recover_idle start count={}", records.len()),
+  );
+
+  let mut live_status_cache: HashMap<String, i64> = HashMap::new();
+  let mut remux_targets = Vec::new();
+
+  for (record_id, room_id, file_path) in records {
+    if let Some(info) = context.live_runtime.get_record_info(&room_id) {
+      if info.file_path == file_path {
+        continue;
+      }
+    }
+
+    let path = PathBuf::from(&file_path);
+    let file_meta = match std::fs::metadata(&path) {
+      Ok(meta) => meta,
+      Err(_) => {
+        let _ = update_record_task(
+          &context.db,
+          record_id,
+          "FAILED",
+          Some(now_rfc3339()),
+          0,
+          Some("录制恢复失败: 文件缺失"),
+        );
+        append_log(
+          &context.app_log_path,
+          &format!("record_recover_missing record_id={} path={}", record_id, file_path),
+        );
+        continue;
+      }
+    };
+
+    let file_size = file_meta.len();
+    let idle_secs = file_meta
+      .modified()
+      .ok()
+      .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+      .map(|age| age.as_secs())
+      .unwrap_or(0);
+    if idle_secs < STALE_RECORD_IDLE_SECS {
+      continue;
+    }
+
+    let live_status = if let Some(status) = live_status_cache.get(&room_id) {
+      *status
+    } else {
+      match fetch_room_info(&context.bilibili, &room_id).await {
+        Ok(info) => {
+          live_status_cache.insert(room_id.clone(), info.live_status);
+          info.live_status
+        }
+        Err(err) => {
+          append_log(
+            &context.app_log_path,
+            &format!("record_recover_live_status_fail room={} err={}", room_id, err),
+          );
+          continue;
+        }
+      }
+    };
+
+    let end_time = now_rfc3339();
+    let (status, error_message) = if file_size == 0 {
+      ("FAILED", Some("录制恢复失败: 空文件"))
+    } else if live_status == 1 {
+      ("FAILED", Some("录制失活: 长时间无写入"))
+    } else {
+      ("STOPPED", None)
+    };
+
+    if let Err(err) = update_record_task(
+      &context.db,
+      record_id,
+      status,
+      Some(end_time.clone()),
+      file_size,
+      error_message,
+    ) {
+      append_log(
+        &context.app_log_path,
+        &format!("record_recover_update_fail record_id={} err={}", record_id, err),
+      );
+      continue;
+    }
+
+    let metadata_path = path.with_extension("metadata.json");
+    if metadata_path.exists() {
+      if let Err(err) =
+        update_metadata_file(metadata_path.to_string_lossy().as_ref(), &end_time, file_size)
+      {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "record_metadata_update_failed record_id={} err={}",
+            record_id, err
+          ),
+        );
+      }
+    }
+
+    let mp4_path = path.with_extension("mp4");
+    if mp4_path.exists() {
+      let mp4_size = std::fs::metadata(&mp4_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+      let mp4_path_str = mp4_path.to_string_lossy().to_string();
+      if let Err(err) = update_record_task_file_path(
+        &context.db,
+        record_id,
+        &mp4_path_str,
+        mp4_size,
+      ) {
+        append_log(
+          &context.app_log_path,
+          &format!("record_recover_mp4_update_fail record_id={} err={}", record_id, err),
+        );
+      }
+      continue;
+    }
+
+    if file_size == 0 {
+      continue;
+    }
+
+    let should_remux = file_meta
+      .modified()
+      .ok()
+      .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+      .map(|age| age <= Duration::from_secs(STALE_RECORD_REMUX_MAX_AGE_SECS))
+      .unwrap_or(false);
+    if should_remux {
+      remux_targets.push((record_id, file_path));
+    }
+  }
+
+  if remux_targets.is_empty() {
+    append_log(&context.app_log_path, "record_recover_idle remux=none");
+    return;
+  }
+
+  append_log(
+    &context.app_log_path,
+    &format!("record_recover_idle remux={}", remux_targets.len()),
+  );
+  for (record_id, file_path) in remux_targets {
+    spawn_segment_remux(context.clone(), record_id, file_path);
+  }
+}
+
+pub fn start_record_recovery_loop(context: LiveContext) {
+  tauri::async_runtime::spawn(async move {
+    loop {
+      recover_idle_recordings(context.clone()).await;
+      tokio::time::sleep(Duration::from_secs(STALE_RECORD_RECOVERY_INTERVAL_SECS)).await;
+    }
+  });
 }
 
 pub fn start_auto_record_loop(context: LiveContext) {

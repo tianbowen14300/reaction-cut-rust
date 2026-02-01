@@ -1893,7 +1893,8 @@ export default function SubmissionSection() {
 
   const remoteStatusTone = (status) => {
     if (status === "已通过") return "bg-emerald-500/10 text-emerald-600";
-    if (status === "未通过") return "bg-rose-500/10 text-rose-600";
+    if (status === "未通过" || status === "已锁定")
+      return "bg-rose-500/10 text-rose-600";
     return "bg-amber-500/10 text-amber-600";
   };
 
@@ -1931,6 +1932,9 @@ export default function SubmissionSection() {
     if (state === -2) {
       return "未通过";
     }
+    if (state === -4) {
+      return "已锁定";
+    }
     if (state === 0) {
       return "已通过";
     }
@@ -1941,7 +1945,8 @@ export default function SubmissionSection() {
   };
 
   const isRemoteRejected = (task) => {
-    return Number(task?.remoteState) === -2;
+    const state = Number(task?.remoteState);
+    return state === -2 || state === -4;
   };
 
   const isRemoteFailed = (task) => {
@@ -2967,14 +2972,12 @@ export default function SubmissionSection() {
                             视频更新
                           </button>
                         ) : null}
-                        {isRemoteRejected(task) ? (
-                          <button
-                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                            onClick={() => openResegmentModal(task.taskId)}
-                          >
-                            重新分段
-                          </button>
-                        ) : null}
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => openResegmentModal(task.taskId)}
+                        >
+                          重新分段
+                        </button>
                         {task.status === "FAILED" && task.hasIntegratedDownloads ? (
                           <button
                             className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
@@ -2983,16 +2986,12 @@ export default function SubmissionSection() {
                             一键投稿
                           </button>
                         ) : null}
-                        {["COMPLETED", "FAILED"].includes(task.status) ||
-                        task.workflowStatus?.status === "FAILED" ||
-                        isRemoteFailed(task) ? (
-                          <button
-                            className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
-                            onClick={() => openRepostModal(task)}
-                          >
-                            重新投稿
-                          </button>
-                        ) : null}
+                        <button
+                          className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
+                          onClick={() => openRepostModal(task)}
+                        >
+                          重新投稿
+                        </button>
                         <button
                           className="rounded-full border border-black/10 bg-white px-2 py-1 text-xs font-semibold text-[var(--ink)]"
                           onClick={() => handleDetail(task.taskId)}

@@ -66,29 +66,47 @@ pub fn init_resource_bins(app_handle: &AppHandle) {
       set_env_if_dir(ENV_BAIDU_PCS_CONFIG_DIR, path);
     }
   }
-  let base_dir = match app_handle.path().resolve("bin", BaseDirectory::Resource) {
-    Ok(path) => path,
-    Err(_) => return,
+  let base_dir = match resolve_resource_bin_dir(app_handle) {
+    Some(path) => path,
+    None => return,
   };
-  let runtime_dir = base_dir.join("runtime");
   let platform_dir = base_dir.join(platform_subdir());
 
-  let ffmpeg_path = resolve_bin_in_dirs(&runtime_dir, &platform_dir, &base_dir, "ffmpeg");
+  let ffmpeg_path = resolve_bin_in_dirs(&platform_dir, &base_dir, "ffmpeg");
   if let Some(path) = ffmpeg_path {
     set_env_if_exists(ENV_FFMPEG_PATH, path);
   }
-  let ffprobe_path = resolve_bin_in_dirs(&runtime_dir, &platform_dir, &base_dir, "ffprobe");
+  let ffprobe_path = resolve_bin_in_dirs(&platform_dir, &base_dir, "ffprobe");
   if let Some(path) = ffprobe_path {
     set_env_if_exists(ENV_FFPROBE_PATH, path);
   }
-  let aria2c_path = resolve_bin_in_dirs(&runtime_dir, &platform_dir, &base_dir, "aria2c");
+  let aria2c_path = resolve_bin_in_dirs(&platform_dir, &base_dir, "aria2c");
   if let Some(path) = aria2c_path {
     set_env_if_exists(ENV_ARIA2C_PATH, path);
   }
-  let baidu_pcs_path = resolve_bin_in_dirs(&runtime_dir, &platform_dir, &base_dir, "BaiduPCS-Go");
+  let baidu_pcs_path = resolve_bin_in_dirs(&platform_dir, &base_dir, "BaiduPCS-Go");
   if let Some(path) = baidu_pcs_path {
     set_env_if_exists(ENV_BAIDU_PCS_PATH, path);
   }
+}
+
+pub fn resolve_resource_bin_dir(app_handle: &AppHandle) -> Option<PathBuf> {
+  let primary = app_handle.path().resolve("bin", BaseDirectory::Resource).ok();
+  if let Some(path) = primary.as_ref() {
+    if path.exists() {
+      return Some(path.clone());
+    }
+  }
+  let fallback = app_handle
+    .path()
+    .resolve("resources/bin", BaseDirectory::Resource)
+    .ok();
+  if let Some(path) = fallback.as_ref() {
+    if path.exists() {
+      return Some(path.clone());
+    }
+  }
+  primary.or(fallback)
 }
 
 pub fn resolve_ffmpeg_path() -> PathBuf {
@@ -182,13 +200,8 @@ fn platform_subdir() -> &'static str {
   }
 }
 
-fn resolve_bin_in_dirs(
-  runtime: &PathBuf,
-  platform: &PathBuf,
-  fallback: &PathBuf,
-  base: &str,
-) -> Option<PathBuf> {
-  for dir in [runtime, platform, fallback] {
+fn resolve_bin_in_dirs(platform: &PathBuf, fallback: &PathBuf, base: &str) -> Option<PathBuf> {
+  for dir in [platform, fallback] {
     let candidate = dir.join(bin_name(base));
     if candidate.exists() {
       return Some(candidate);

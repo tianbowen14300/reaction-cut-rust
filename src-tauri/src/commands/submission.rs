@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use url::form_urlencoded;
 
@@ -656,11 +655,37 @@ pub async fn submission_repost(
         &format!("submission_repost_missing_source task_id={} path={}", task_id, path),
       );
     }
-    let download_ids = load_integrated_download_ids(&context, &task_id)?;
-    if download_ids.is_empty() {
-      return Ok(ApiResponse::error("源视频不存在且未关联下载记录，请先补充下载"));
+    let integrated_records = load_integrated_download_records(&context, &task_id)?;
+    if integrated_records.is_empty() {
+      return Ok(ApiResponse::error("源视频不存在，请先下载"));
     }
-    reset_submission_for_repost(
+    let mut records_by_path: HashMap<String, IntegratedDownloadRecord> = HashMap::new();
+    for record in integrated_records {
+      if !record.local_path.trim().is_empty() {
+        records_by_path.insert(record.local_path.clone(), record);
+      }
+    }
+    let mut missing_records = Vec::new();
+    let mut missing_without_download = Vec::new();
+    for path in &missing_sources {
+      if let Some(record) = records_by_path.get(path) {
+        missing_records.push(record.clone());
+      } else {
+        missing_without_download.push(path.clone());
+      }
+    }
+    if !missing_without_download.is_empty() {
+      append_log(
+        &state.app_log_path,
+        &format!(
+          "submission_repost_missing_unbound task_id={} count={}",
+          task_id,
+          missing_without_download.len()
+        ),
+      );
+      return Ok(ApiResponse::error("源视频不存在，请先下载"));
+    }
+    let workflow_instance_id = reset_submission_for_repost(
       &context,
       &state.app_log_path,
       &task_id,
@@ -668,13 +693,15 @@ pub async fn submission_repost(
       if integrate_current_bvid { "VIDEO_UPDATE" } else { "VIDEO_SUBMISSION" },
       !integrate_current_bvid,
     )?;
-    crate::commands::download::requeue_integrated_downloads(&state, &download_ids).await?;
+    let new_download_ids =
+      create_retry_download_records(&context, &task_id, &workflow_instance_id, &missing_records)?;
+    crate::commands::download::requeue_integrated_downloads(&state, &new_download_ids).await?;
     return Ok(ApiResponse::success(
-      "源视频缺失，已加入下载队列，下载完成后自动重新投稿".to_string(),
+      "源视频缺失，已创建下载任务，下载完成后自动重新投稿".to_string(),
     ));
   }
 
-  reset_submission_for_repost(
+  let _ = reset_submission_for_repost(
     &context,
     &state.app_log_path,
     &task_id,
@@ -705,19 +732,99 @@ fn collect_missing_source_files(sources: &[TaskSourceVideoRecord]) -> Vec<String
   missing
 }
 
-fn load_integrated_download_ids(
+fn load_integrated_download_records(
   context: &SubmissionContext,
   task_id: &str,
-) -> Result<Vec<i64>, String> {
+) -> Result<Vec<IntegratedDownloadRecord>, String> {
   context
     .db
     .with_conn(|conn| {
       let mut stmt = conn.prepare(
-        "SELECT download_task_id FROM task_relations WHERE submission_task_id = ?1 AND relation_type = 'INTEGRATED' ORDER BY id ASC",
+        "SELECT vd.id, vd.download_url, vd.bvid, vd.aid, vd.title, vd.part_title, \
+                vd.part_count, vd.current_part, vd.local_path, vd.resolution, vd.codec, \
+                vd.format, vd.cid, vd.content \
+         FROM task_relations tr \
+         JOIN video_download vd ON tr.download_task_id = vd.id \
+         WHERE tr.submission_task_id = ?1 AND tr.relation_type = 'INTEGRATED'",
       )?;
-      let rows = stmt.query_map([task_id], |row| row.get(0))?;
-      let list = rows.collect::<Result<Vec<i64>, _>>()?;
-      Ok(list)
+      let rows = stmt.query_map([task_id], |row| {
+        Ok(IntegratedDownloadRecord {
+          id: row.get(0)?,
+          download_url: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+          bvid: row.get(2)?,
+          aid: row.get(3)?,
+          title: row.get(4)?,
+          part_title: row.get(5)?,
+          part_count: row.get(6)?,
+          current_part: row.get(7)?,
+          local_path: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+          resolution: row.get(9)?,
+          codec: row.get(10)?,
+          format: row.get(11)?,
+          cid: row.get(12)?,
+          content: row.get(13)?,
+        })
+      })?;
+      Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn create_retry_download_records(
+  context: &SubmissionContext,
+  task_id: &str,
+  workflow_instance_id: &str,
+  records: &[IntegratedDownloadRecord],
+) -> Result<Vec<i64>, String> {
+  if records.is_empty() {
+    return Ok(Vec::new());
+  }
+  let now = now_rfc3339();
+  context
+    .db
+    .with_conn(|conn| {
+      let mut new_ids = Vec::with_capacity(records.len());
+      for record in records {
+        if record.download_url.trim().is_empty() {
+          return Err("下载记录缺少下载地址，无法重新下载".to_string());
+        }
+        if record.local_path.trim().is_empty() {
+          return Err("下载记录缺少本地路径，无法重新下载".to_string());
+        }
+        conn.execute(
+          "INSERT INTO video_download (bvid, aid, title, part_title, part_count, current_part, download_url, local_path, status, progress, progress_total, progress_done, create_time, update_time, resolution, codec, format, cid, content) \
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, 0, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+          (
+            record.bvid.as_deref(),
+            record.aid.as_deref(),
+            record.title.as_deref(),
+            record.part_title.as_deref(),
+            record.part_count,
+            record.current_part,
+            record.download_url.as_str(),
+            record.local_path.as_str(),
+            &now,
+            &now,
+            record.resolution.as_deref(),
+            record.codec.as_deref(),
+            record.format.as_deref(),
+            record.cid,
+            record.content.as_deref(),
+          ),
+        )?;
+        let new_id = conn.last_insert_rowid();
+        conn.execute(
+          "DELETE FROM task_relations WHERE submission_task_id = ?1 AND download_task_id = ?2 AND relation_type = 'INTEGRATED'",
+          (task_id, record.id),
+        )?;
+        conn.execute(
+          "INSERT INTO task_relations (download_task_id, submission_task_id, relation_type, status, created_at, updated_at, workflow_instance_id, workflow_status, retry_count) \
+           VALUES (?1, ?2, 'INTEGRATED', 'ACTIVE', ?3, ?4, ?5, 'PENDING_DOWNLOAD', 0)",
+          (new_id, task_id, &now, &now, workflow_instance_id),
+        )?;
+        new_ids.push(new_id);
+      }
+      Ok(new_ids)
     })
     .map_err(|err| err.to_string())
 }
@@ -729,7 +836,7 @@ fn reset_submission_for_repost(
   workflow_config: &Value,
   workflow_type: &str,
   clear_bvid: bool,
-) -> Result<(), String> {
+) -> Result<String, String> {
   append_log(
     app_log_path,
     &format!("submission_repost_start task_id={} type={}", task_id, workflow_type),
@@ -792,7 +899,7 @@ fn reset_submission_for_repost(
     )?;
     Ok(())
   });
-  Ok(())
+  Ok(instance_id)
 }
 
 #[tauri::command]
@@ -2294,12 +2401,28 @@ const SOURCE_READY_MAX_RETRIES: u32 = 30;
 const SOURCE_READY_MAX_WAIT_SECS: u64 = 30;
 
 struct SourceReadyInfo {
+  source: ClipSource,
   path: String,
   size: u64,
-  end_time: Option<f64>,
 }
 
-async fn check_sources_ready(sources: &[ClipSource]) -> Result<(), String> {
+fn format_timecode_seconds(seconds: f64) -> String {
+  let total = if seconds.is_finite() { seconds.max(0.0) } else { 0.0 };
+  let hours = (total / 3600.0).floor() as i64;
+  let minutes = ((total - (hours as f64 * 3600.0)) / 60.0).floor() as i64;
+  let secs = total - (hours as f64 * 3600.0) - (minutes as f64 * 60.0);
+  if secs.fract().abs() < 0.001 {
+    format!("{:02}:{:02}:{:02}", hours, minutes, secs.floor() as i64)
+  } else {
+    format!("{:02}:{:02}:{:06.3}", hours, minutes, secs)
+  }
+}
+
+async fn check_sources_ready(
+  context: &SubmissionContext,
+  task_id: &str,
+  sources: &[ClipSource],
+) -> Result<Vec<ClipSource>, String> {
   let mut infos = Vec::with_capacity(sources.len());
   for source in sources {
     let path = Path::new(&source.input_path);
@@ -2309,14 +2432,10 @@ async fn check_sources_ready(sources: &[ClipSource]) -> Result<(), String> {
     if size == 0 {
       return Err(format!("源文件大小为0 input={}", source.input_path));
     }
-    let end_time = source
-      .end_time
-      .as_deref()
-      .and_then(|value| parse_time_to_seconds(value));
     infos.push(SourceReadyInfo {
+      source: source.clone(),
       path: source.input_path.clone(),
       size,
-      end_time,
     });
   }
 
@@ -2329,33 +2448,104 @@ async fn check_sources_ready(sources: &[ClipSource]) -> Result<(), String> {
     }
   }
 
-  for info in &infos {
+  let mut normalized = Vec::with_capacity(infos.len());
+  for info in infos {
     let duration = probe_duration_seconds(Path::new(&info.path))
       .map_err(|err| format!("源文件不可读 input={} err={}", info.path, err))?;
-    if let Some(end_time) = info.end_time {
-      if duration + 0.5 < end_time {
-        return Err(format!(
-          "源文件时长不足 input={} duration={} end={}",
-          info.path, duration, end_time
-        ));
-      }
+    let mut start = info
+      .source
+      .start_time
+      .as_deref()
+      .and_then(|value| parse_time_to_seconds(value))
+      .unwrap_or(0.0);
+    let end_config = info
+      .source
+      .end_time
+      .as_deref()
+      .and_then(|value| parse_time_to_seconds(value));
+    let mut end = end_config.unwrap_or(duration);
+    let mut reset = false;
+
+    if end <= 0.0 {
+      end = duration;
+      reset = true;
     }
+    if let Some(config_end) = end_config {
+      if config_end > duration {
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_clip_time_clamp task_id={} input={} end={} duration={}",
+            task_id, info.path, config_end, duration
+          ),
+        );
+        let end_time = format_timecode_seconds(duration);
+        let update_result = context.db.with_conn(|conn| {
+          conn.execute(
+            "UPDATE task_source_video SET end_time = ?1 WHERE task_id = ?2 AND source_file_path = ?3 AND sort_order = ?4",
+            (&end_time, task_id, &info.path, info.source.order),
+          )
+        });
+        if let Err(err) = update_result {
+          append_log(
+            &context.app_log_path,
+            &format!(
+              "submission_clip_time_update_fail task_id={} input={} err={}",
+              task_id, info.path, err
+            ),
+          );
+        }
+        end = duration;
+      }
+    } else {
+      end = duration;
+    }
+    if start < 0.0 || start >= end {
+      start = 0.0;
+      if end_config.is_none() {
+        end = duration;
+      }
+      reset = true;
+    }
+
+    if reset {
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_clip_time_reset task_id={} input={} start={} end={} duration={}",
+          task_id, info.path, start, end, duration
+        ),
+      );
+    }
+
+    let start_time = if start <= 0.0 {
+      Some("00:00:00".to_string())
+    } else {
+      Some(format_timecode_seconds(start))
+    };
+    let end_time = Some(format_timecode_seconds(end));
+    normalized.push(ClipSource {
+      input_path: info.source.input_path,
+      start_time,
+      end_time,
+      order: info.source.order,
+    });
   }
 
-  Ok(())
+  Ok(normalized)
 }
 
 async fn ensure_sources_ready(
   context: &SubmissionContext,
   task_id: &str,
   sources: &[ClipSource],
-) -> Result<(), String> {
+) -> Result<Vec<ClipSource>, String> {
   let mut attempt = 0;
   let mut wait_secs = SOURCE_READY_STABLE_DELAY_SECS;
   loop {
     let _ = wait_for_workflow_ready(context, task_id).await?;
-    match check_sources_ready(sources).await {
-      Ok(()) => return Ok(()),
+    match check_sources_ready(context, task_id, sources).await {
+      Ok(normalized) => return Ok(normalized),
       Err(err) => {
         attempt += 1;
         append_log(
@@ -2402,7 +2592,7 @@ async fn run_submission_workflow(
     return Err("No source videos".to_string());
   }
 
-  ensure_sources_ready(&context, &task_id, &sources).await?;
+  let sources = ensure_sources_ready(&context, &task_id, &sources).await?;
   let _ = wait_for_workflow_ready(&context, &task_id).await?;
   let _ = update_workflow_status(&context, &task_id, "RUNNING", Some("CLIPPING"), 0.0);
   update_submission_status(&context, &task_id, "CLIPPING")?;
@@ -2744,6 +2934,24 @@ struct SubmissionSubmitResult {
   aid: i64,
 }
 
+#[derive(Clone)]
+struct IntegratedDownloadRecord {
+  id: i64,
+  download_url: String,
+  bvid: Option<String>,
+  aid: Option<String>,
+  title: Option<String>,
+  part_title: Option<String>,
+  part_count: Option<i64>,
+  current_part: Option<i64>,
+  local_path: String,
+  resolution: Option<String>,
+  codec: Option<String>,
+  format: Option<String>,
+  cid: Option<i64>,
+  content: Option<String>,
+}
+
 const MAX_PARTS_PER_SUBMISSION: usize = 100;
 const RATE_LIMIT_BASE_WAIT_SECS: u64 = 60;
 const RATE_LIMIT_MAX_WAIT_SECS: u64 = 30 * 60;
@@ -2752,6 +2960,9 @@ const REMOTE_AUDIT_STATUS: &str = "is_pubing,not_pubed";
 const REMOTE_DEBUG_BVID: &str = "BV1VJkFBZENQ";
 const UPLOAD_RETRY_BASE_DELAY_SECS: u64 = 2;
 const UPLOAD_RETRY_MAX_DELAY_SECS: u64 = 30;
+const PREUPLOAD_PARSE_RETRY_BASE_SECS: u64 = 60;
+const PREUPLOAD_PARSE_RETRY_MAX_SECS: u64 = 30 * 60;
+const PREUPLOAD_PARSE_RETRY_LIMIT: u32 = 6;
 
 struct UploadRateLimiter {
   consecutive_406: u32,
@@ -2785,6 +2996,47 @@ fn upload_retry_delay_secs(attempt: u32) -> u64 {
   let multiplier = 1u64 << exponent.min(5);
   let wait = UPLOAD_RETRY_BASE_DELAY_SECS.saturating_mul(multiplier);
   wait.min(UPLOAD_RETRY_MAX_DELAY_SECS)
+}
+
+fn preupload_parse_retry_delay_secs(attempt: u32) -> u64 {
+  let exponent = attempt.saturating_sub(1);
+  let multiplier = 1u64 << exponent.min(10);
+  let wait = PREUPLOAD_PARSE_RETRY_BASE_SECS.saturating_mul(multiplier);
+  wait.min(PREUPLOAD_PARSE_RETRY_MAX_SECS)
+}
+
+fn is_preupload_parse_error(err: &str) -> bool {
+  err.contains("预上传解析失败") || err.contains("error decoding response body")
+}
+
+fn build_uploaded_parts(
+  detail: &SubmissionTaskDetail,
+  is_update_workflow: bool,
+) -> Result<Vec<UploadedVideoPart>, String> {
+  let mut parts = Vec::with_capacity(detail.output_segments.len());
+  for (index, segment) in detail.output_segments.iter().enumerate() {
+    if segment.upload_status != "SUCCESS" {
+      return Err("存在分段未上传完成".to_string());
+    }
+    let cid = segment
+      .cid
+      .ok_or_else(|| format!("分段缺少CID segment_id={}", segment.segment_id))?;
+    let filename = segment
+      .file_name
+      .clone()
+      .ok_or_else(|| format!("分段缺少文件名 segment_id={}", segment.segment_id))?;
+    let title = if is_update_workflow {
+      resolve_existing_part_title(&detail.task, &segment.part_name, index + 1)
+    } else {
+      build_part_title(detail.task.segment_prefix.as_deref(), index + 1)
+    };
+    parts.push(UploadedVideoPart {
+      filename,
+      cid,
+      title,
+    });
+  }
+  Ok(parts)
 }
 
 async fn run_submission_upload(
@@ -2845,207 +3097,139 @@ async fn run_submission_upload(
   let client = Client::new();
   let mut parts: Vec<UploadedVideoPart> = Vec::new();
 
-  if is_update_workflow {
+  if is_update_workflow || settings.enable_segmentation {
     if detail.output_segments.is_empty() {
       update_submission_status(&submission_context, &task_id, "FAILED")?;
       return Err("未找到分段文件".to_string());
     }
-    set_output_segments_uploading(&submission_context, &task_id)?;
-    let semaphore = Arc::new(Semaphore::new(upload_concurrency));
-    let mut futures = FuturesUnordered::new();
-    let mut segment_results: Vec<Option<UploadedVideoPart>> =
-      vec![None; detail.output_segments.len()];
-    let mut failed_segments: Vec<String> = Vec::new();
-    let segment_titles: Vec<String> = detail
-      .output_segments
-      .iter()
-      .enumerate()
-      .map(|(index, segment)| {
-        resolve_existing_part_title(&detail.task, &segment.part_name, index + 1)
-      })
-      .collect();
-
-    for (index, segment) in detail.output_segments.iter().enumerate() {
-      if segment.upload_status == "SUCCESS" {
-        if let (Some(cid), Some(filename)) = (segment.cid, segment.file_name.clone()) {
-          segment_results[index] = Some(UploadedVideoPart {
-            filename,
-            cid,
-            title: segment_titles[index].clone(),
-          });
-          continue;
+    let mut preupload_retry_round: u32 = 0;
+    loop {
+      let detail = load_task_detail(&submission_context, &task_id)?;
+      if detail.output_segments.is_empty() {
+        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        return Err("未找到分段文件".to_string());
+      }
+      let failed_count = detail
+        .output_segments
+        .iter()
+        .filter(|segment| segment.upload_status == "FAILED")
+        .count();
+      if failed_count > 0 {
+        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        return Err("存在分段上传失败，请重试失败分P".to_string());
+      }
+      let pending: Vec<(usize, String)> = detail
+        .output_segments
+        .iter()
+        .enumerate()
+        .filter(|(_, segment)| segment.upload_status != "SUCCESS")
+        .map(|(index, segment)| (index, segment.segment_id.clone()))
+        .collect();
+      if pending.is_empty() {
+        match build_uploaded_parts(&detail, is_update_workflow) {
+          Ok(list) => {
+            parts = list;
+            break;
+          }
+          Err(err) => {
+            update_submission_status(&submission_context, &task_id, "FAILED")?;
+            return Err(err);
+          }
         }
       }
-      let segment_id = segment.segment_id.clone();
-      let context_clone = submission_context.clone();
-      let upload_context_clone = context.clone();
-      let client_clone = client.clone();
-      let auth_clone = auth.clone();
-      let log_path = context.app_log_path.clone();
-      let permit = semaphore.clone();
-
-      futures.push(async move {
-        let _permit = match permit.acquire_owned().await {
-          Ok(permit) => permit,
-          Err(_) => {
-            return (
-              index,
-              segment_id,
-              Err("上传并发控制失败".to_string()),
+      let pending_count = pending.len();
+      let batch: Vec<(usize, String)> =
+        pending.into_iter().take(upload_concurrency).collect();
+      append_log(
+        &context.app_log_path,
+        &format!(
+          "submission_segment_batch_start task_id={} pending={} batch={}",
+          task_id,
+          pending_count,
+          batch.len()
+        ),
+      );
+      for (_, segment_id) in &batch {
+        update_segment_upload_status(&submission_context, segment_id, "UPLOADING")?;
+      }
+      let mut futures = FuturesUnordered::new();
+      for (_, segment_id) in batch {
+        let context_clone = submission_context.clone();
+        let upload_context_clone = context.clone();
+        let client_clone = client.clone();
+        let auth_clone = auth.clone();
+        let log_path = context.app_log_path.clone();
+        futures.push(async move {
+          let result = upload_segment_with_retry(
+            &context_clone,
+            &upload_context_clone,
+            &client_clone,
+            &auth_clone,
+            &segment_id,
+            log_path.as_ref(),
+            UPLOAD_SEGMENT_RETRY_LIMIT,
+          )
+          .await;
+          (segment_id, result)
+        });
+      }
+      let mut has_preupload_parse_error = false;
+      let mut has_other_error = false;
+      while let Some((segment_id, result)) = futures.next().await {
+        match result {
+          Ok(upload_result) => {
+            update_segment_upload_result(
+              &submission_context,
+              &segment_id,
+              "SUCCESS",
+              Some(upload_result.cid),
+              Some(upload_result.filename.clone()),
+            )?;
+          }
+          Err(err) => {
+            if is_preupload_parse_error(&err) {
+              let _ = clear_upload_session(
+                &submission_context,
+                &UploadTarget::Segment(segment_id.clone()),
+              );
+              update_segment_upload_status(&submission_context, &segment_id, "PENDING")?;
+              has_preupload_parse_error = true;
+            } else {
+              update_segment_upload_status(&submission_context, &segment_id, "FAILED")?;
+              has_other_error = true;
+            }
+            append_log(
+              &context.app_log_path,
+              &format!(
+                "submission_segment_upload_fail segment_id={} err={}",
+                segment_id, err
+              ),
             );
           }
-        };
-        let result = upload_segment_with_retry(
-          &context_clone,
-          &upload_context_clone,
-          &client_clone,
-          &auth_clone,
-          &segment_id,
-          log_path.as_ref(),
-          UPLOAD_SEGMENT_RETRY_LIMIT,
-        )
-        .await;
-        drop(_permit);
-        (index, segment_id, result)
-      });
-    }
-
-    while let Some((index, segment_id, result)) = futures.next().await {
-      match result {
-        Ok(upload_result) => {
-          update_segment_upload_result(
-            &submission_context,
-            &segment_id,
-            "SUCCESS",
-            Some(upload_result.cid),
-            Some(upload_result.filename.clone()),
-          )?;
-          segment_results[index] = Some(UploadedVideoPart {
-            filename: upload_result.filename,
-            cid: upload_result.cid,
-            title: segment_titles[index].clone(),
-          });
-        }
-        Err(err) => {
-          update_segment_upload_status(&submission_context, &segment_id, "FAILED")?;
-          append_log(
-            &context.app_log_path,
-            &format!(
-              "submission_segment_upload_fail segment_id={} err={}",
-              segment_id, err
-            ),
-          );
-          failed_segments.push(segment_id);
         }
       }
-    }
-
-    for item in segment_results.into_iter() {
-      if let Some(part) = item {
-        parts.push(part);
+      if has_other_error {
+        update_submission_status(&submission_context, &task_id, "FAILED")?;
+        return Err("存在分段上传失败，请重试失败分P".to_string());
       }
-    }
-
-    if !failed_segments.is_empty() || parts.len() != detail.output_segments.len() {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
-      return Err("存在分段上传失败，请重试失败分P".to_string());
-    }
-  } else if settings.enable_segmentation {
-    if detail.output_segments.is_empty() {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
-      return Err("未找到分段文件".to_string());
-    }
-    set_output_segments_uploading(&submission_context, &task_id)?;
-    let semaphore = Arc::new(Semaphore::new(upload_concurrency));
-    let mut futures = FuturesUnordered::new();
-    let mut segment_results: Vec<Option<UploadedVideoPart>> =
-      vec![None; detail.output_segments.len()];
-    let mut failed_segments: Vec<String> = Vec::new();
-
-    for (index, segment) in detail.output_segments.iter().enumerate() {
-      if segment.upload_status == "SUCCESS" {
-        if let (Some(cid), Some(filename)) = (segment.cid, segment.file_name.clone()) {
-          segment_results[index] = Some(UploadedVideoPart {
-            filename,
-            cid,
-            title: build_part_title(detail.task.segment_prefix.as_deref(), index + 1),
-          });
-          continue;
+      if has_preupload_parse_error {
+        preupload_retry_round = preupload_retry_round.saturating_add(1);
+        if preupload_retry_round > PREUPLOAD_PARSE_RETRY_LIMIT {
+          update_submission_status(&submission_context, &task_id, "FAILED")?;
+          return Err("预上传解析失败重试次数已达上限".to_string());
         }
+        let wait_secs = preupload_parse_retry_delay_secs(preupload_retry_round);
+        append_log(
+          &context.app_log_path,
+          &format!(
+            "submission_segment_preupload_retry task_id={} wait_secs={} round={}",
+            task_id, wait_secs, preupload_retry_round
+          ),
+        );
+        sleep(Duration::from_secs(wait_secs)).await;
+      } else {
+        preupload_retry_round = 0;
       }
-      let segment_id = segment.segment_id.clone();
-      let context_clone = submission_context.clone();
-      let upload_context_clone = context.clone();
-      let client_clone = client.clone();
-      let auth_clone = auth.clone();
-      let log_path = context.app_log_path.clone();
-      let permit = semaphore.clone();
-
-      futures.push(async move {
-        let _permit = match permit.acquire_owned().await {
-          Ok(permit) => permit,
-          Err(_) => {
-            return (
-              index,
-              segment_id,
-              Err("上传并发控制失败".to_string()),
-            );
-          }
-        };
-        let result = upload_segment_with_retry(
-          &context_clone,
-          &upload_context_clone,
-          &client_clone,
-          &auth_clone,
-          &segment_id,
-          log_path.as_ref(),
-          UPLOAD_SEGMENT_RETRY_LIMIT,
-        )
-        .await;
-        drop(_permit);
-        (index, segment_id, result)
-      });
-    }
-
-    while let Some((index, segment_id, result)) = futures.next().await {
-      match result {
-        Ok(upload_result) => {
-          update_segment_upload_result(
-            &submission_context,
-            &segment_id,
-            "SUCCESS",
-            Some(upload_result.cid),
-            Some(upload_result.filename.clone()),
-          )?;
-          segment_results[index] = Some(UploadedVideoPart {
-            filename: upload_result.filename,
-            cid: upload_result.cid,
-            title: build_part_title(detail.task.segment_prefix.as_deref(), index + 1),
-          });
-        }
-        Err(err) => {
-          update_segment_upload_status(&submission_context, &segment_id, "FAILED")?;
-          append_log(
-            &context.app_log_path,
-            &format!(
-              "submission_segment_upload_fail segment_id={} err={}",
-              segment_id, err
-            ),
-          );
-          failed_segments.push(segment_id);
-        }
-      }
-    }
-
-    for item in segment_results.into_iter() {
-      if let Some(part) = item {
-        parts.push(part);
-      }
-    }
-
-    if !failed_segments.is_empty() || parts.len() != detail.output_segments.len() {
-      update_submission_status(&submission_context, &task_id, "FAILED")?;
-      return Err("存在分段上传失败，请重试失败分P".to_string());
     }
   } else {
     let merged = load_latest_merged_video(&submission_context, &task_id)?;
@@ -5223,19 +5407,6 @@ fn save_output_segments(
           ),
         )?;
       }
-      Ok(())
-    })
-    .map_err(|err| err.to_string())
-}
-
-fn set_output_segments_uploading(context: &SubmissionContext, task_id: &str) -> Result<(), String> {
-  context
-    .db
-    .with_conn(|conn| {
-      conn.execute(
-        "UPDATE task_output_segment SET upload_status = 'UPLOADING' WHERE task_id = ?1 AND upload_status != 'SUCCESS'",
-        [task_id],
-      )?;
       Ok(())
     })
     .map_err(|err| err.to_string())
